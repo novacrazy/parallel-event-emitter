@@ -105,6 +105,9 @@ mod internal {
     use std::sync::{Arc, RwLock, Mutex};
 
     use trace_error::Trace;
+
+    use fnv::FnvHashMap;
+
     use futures::{self, future, Future, BoxFuture};
     use futures_cpupool::CpuPool;
 
@@ -113,8 +116,6 @@ mod internal {
 
     #[cfg(not(feature = "integer_atomics"))]
     pub use std::sync::atomic::AtomicUsize as AtomicListenerId;
-
-    use fnv::FnvHashMap;
 
     use super::{ListenerId, EventError, EventResult};
 
