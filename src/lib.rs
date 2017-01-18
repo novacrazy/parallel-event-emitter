@@ -85,16 +85,10 @@ use std::sync::{Arc, RwLock};
 
 use std::sync::atomic::Ordering;
 
-#[cfg(feature = "integer_atomics")]
-use std::sync::atomic::AtomicListenerId as AtomicListenerId;
-
-#[cfg(not(feature = "integer_atomics"))]
-use std::sync::atomic::AtomicUsize as AtomicListenerId;
-
 use fnv::FnvHashMap;
 use std::collections::hash_map::Entry;
 
-use futures::{future, Future, BoxFuture};
+use futures::{Future, BoxFuture};
 use futures_cpupool::CpuPool;
 
 use trace_error::Trace;
@@ -107,11 +101,40 @@ pub use self::error::*;
 /// 
 /// By putting most of it in its own module it helps with organization.
 mod internal {
-    use super::*;
+    use std::any::Any;
+    use std::sync::{Arc, RwLock, Mutex};
 
-    // This allows callbacks to take both values and references depending on the situation
+    use trace_error::Trace;
+    use futures::{self, future, Future, BoxFuture};
+    use futures_cpupool::CpuPool;
+
+    #[cfg(feature = "integer_atomics")]
+    pub use std::sync::atomic::AtomicListenerId as AtomicListenerId;
+
+    #[cfg(not(feature = "integer_atomics"))]
+    pub use std::sync::atomic::AtomicUsize as AtomicListenerId;
+
+    use fnv::FnvHashMap;
+
+    use super::{ListenerId, EventError, EventResult};
+
+    /// Helper function to map listener results with
+    #[allow(inline_always)]
+    #[inline(always)]
+    pub fn ran(_: ()) -> bool {
+        true
+    }
+
+    /// Helper function to count successfully ran listeners
+    pub fn count_ran(executed: Vec<bool>) -> usize {
+        executed.into_iter().filter(|ran| *ran).count()
+    }
+
+    /// This allows callbacks to take both values and references depending on the situation
     pub enum ArcCowish {
+        /// Owned value that can be moved out
         Owned(Box<Any>),
+        /// Borrowed value that must be passed by reference
         Borrowed(Arc<Box<Any>>),
     }
 
@@ -119,12 +142,14 @@ mod internal {
     /// and returns `Ok(true)` if the listener callback was invoked correctly.
     pub type SyncCallback = Box<FnMut(ListenerId, Option<ArcCowish>) -> EventResult<bool>>;
 
-    // Stores the listener callback and its ID value
-    //
-    // The odd order of locks and `Arc`s is due to needing to access the `id` field without locking
+    /// Stores the listener callback and its ID value
+    ///
+    /// The odd order of locks and `Arc`s is due to needing to access the `id` field without locking
     pub struct SyncEventListener {
+        /// Unique ID of the listener
         pub id: ListenerId,
-        pub cb: RwLock<SyncCallback>,
+        /// Lockable callback. It must have a lock because as an `Fn`
+        pub cb: Mutex<SyncCallback>,
     }
 
     unsafe impl Send for SyncEventListener {}
@@ -134,18 +159,23 @@ mod internal {
     impl SyncEventListener {
         /// Create a new `SyncEventListener` from an id and callback
         pub fn new(id: ListenerId, cb: SyncCallback) -> Arc<SyncEventListener> {
-            Arc::new(SyncEventListener { id: id, cb: RwLock::new(cb) })
+            Arc::new(SyncEventListener { id: id, cb: Mutex::new(cb) })
         }
     }
 
+    /// Reference counted `SyncEventListener`
     pub type SyncEventListenerLock = Arc<SyncEventListener>;
 
+    /// Reference counted and lockable listener vector
     pub type SyncListenersLock = Arc<RwLock<Vec<SyncEventListenerLock>>>;
 
     /// Inner structure that can be referenced from within the threadpool and listener callbacks
     pub struct Inner {
+        /// Event table
         pub events: RwLock<FnvHashMap<String, SyncListenersLock>>,
+        /// Atomic counter that always increments
         pub counter: AtomicListenerId,
+        /// Threadpool to dispatch listener callbacks in
         pub pool: CpuPool,
     }
 
@@ -211,7 +241,7 @@ mod internal {
                     let listener = listener.clone();
 
                     let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                        let mut cb_guard = try_throw!(listener.cb.write());
+                        let mut cb_guard = try_throw!(listener.cb.lock());
 
                         // Force a mutable reference to the callback
                         (&mut *cb_guard)(listener.id, None)
@@ -244,7 +274,7 @@ mod internal {
                     let value = value.clone();
 
                     let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                        let mut cb_guard = try_throw!(listener.cb.write());
+                        let mut cb_guard = try_throw!(listener.cb.lock());
 
                         // Force a mutable reference to the callback
                         (&mut *cb_guard)(listener.id, Some(ArcCowish::Owned(Box::new(value))))
@@ -287,7 +317,7 @@ mod internal {
                     let wrapper = wrapper.clone();
 
                     let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                        let mut cb_guard = try_throw!(listener.cb.write());
+                        let mut cb_guard = try_throw!(listener.cb.lock());
 
                         // Force a mutable reference to the callback
                         (&mut *cb_guard)(listener.id, Some(ArcCowish::Borrowed(wrapper.inner)))
@@ -322,18 +352,6 @@ impl Default for ParallelEventEmitter {
     }
 }
 
-/// Helper function to map listener results with
-#[allow(inline_always)]
-#[inline(always)]
-fn ran(_: ()) -> bool {
-    true
-}
-
-/// Helper function to count successfully ran listeners
-fn count_ran(executed: Vec<bool>) -> usize {
-    executed.into_iter().filter(|ran| *ran).count()
-}
-
 impl ParallelEventEmitter {
     /// Creates a new `ParallelEventEmitter` with the default `CpuPool`
     pub fn new() -> ParallelEventEmitter {
@@ -347,7 +365,7 @@ impl ParallelEventEmitter {
         ParallelEventEmitter {
             inner: Arc::new(Inner {
                 events: RwLock::new(FnvHashMap::default()),
-                counter: AtomicListenerId::new(0),
+                counter: internal::AtomicListenerId::new(0),
                 pool: pool,
             })
         }
@@ -405,7 +423,7 @@ impl ParallelEventEmitter {
     /// Simple wrapper around `add_listener_impl` that automatically maps the result to `ran`
     #[inline]
     fn add_listener_impl_simple<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<()> + 'static {
-        self.add_listener_impl(event, move |id, arg| cb(id, arg).map(ran))
+        self.add_listener_impl(event, move |id, arg| cb(id, arg).map(internal::ran))
     }
 
     /// Internal function that takes care of removing the listener for `once` listener callbacks
@@ -438,7 +456,7 @@ impl ParallelEventEmitter {
                 }
             }
 
-            cb(id, arg).map(ran)
+            cb(id, arg).map(internal::ran)
         })
     }
 
