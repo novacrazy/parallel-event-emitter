@@ -12,7 +12,7 @@
 //! ```toml
 //! [dependencies]
 //! futures = "0.1"
-//! parallel-event-emitter = "0.1.2"
+//! parallel-event-emitter = "0.2.0"
 //! ```
 //!
 //! ```rust
@@ -23,7 +23,7 @@
 //! use parallel_event_emitter::*;
 //!
 //! fn main() {
-//!     let mut emitter = ParallelEventEmitter::new();
+//!     let mut emitter: ParallelEventEmitter<String> = ParallelEventEmitter::new();
 //!
 //!     emitter.add_listener("some event", || {
 //!         println!("Hello, World!");
@@ -32,6 +32,34 @@
 //!     }).unwrap();
 //!
 //!     assert_eq!(1, emitter.emit("some event").wait().unwrap());
+//! }
+//! ```
+//!
+//! Or using a custom event type:
+//!
+//! ```rust
+//! extern crate futures;
+//! extern crate parallel_event_emitter;
+//!
+//! use futures::Future;
+//! use parallel_event_emitter::*;
+//!
+//! #[derive(Debug, Hash, PartialEq, Eq, Clone)]
+//! enum MyEvents {
+//!     EventA,
+//!     EventB,
+//! }
+//!
+//! fn main() {
+//!     let mut emitter: ParallelEventEmitter<MyEvents> = ParallelEventEmitter::new();
+//!
+//!     emitter.add_listener(MyEvents::EventA, || {
+//!         println!("Hello, World!");
+//!
+//!         Ok(())
+//!     }).unwrap();
+//!
+//!     assert_eq!(1, emitter.emit(MyEvents::EventA).wait().unwrap());
 //! }
 //! ```
 //!
@@ -49,7 +77,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.1.2"
+//! version = "0.2.0"
 //! features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 //! ```
 //!
@@ -62,7 +90,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.1.2"
+//! version = "0.2.0"
 //! features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 //! ```
 //!

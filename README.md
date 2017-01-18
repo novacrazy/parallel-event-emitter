@@ -13,7 +13,7 @@ Additionally, all types `T` must be `Any`, so `T: 'static`.
 ```toml
 [dependencies]
 futures = "0.1"
-parallel-event-emitter = "0.1.2"
+parallel-event-emitter = "0.2.0"
 ```
 
 ```rust
@@ -36,6 +36,34 @@ fn main() {
 }
 ```
 
+Or using a custom event type:
+
+```rust
+extern crate futures;
+extern crate parallel_event_emitter;
+
+use futures::Future;
+use parallel_event_emitter::*;
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+enum MyEvents {
+    EventA,
+    EventB,
+}
+
+fn main() {
+    let mut emitter: ParallelEventEmitter<MyEvents> = ParallelEventEmitter::new();
+
+    emitter.add_listener(MyEvents::EventA, || {
+        println!("Hello, World!");
+
+        Ok(())
+    }).unwrap();
+
+    assert_eq!(1, emitter.emit(MyEvents::EventA).wait().unwrap());
+}
+```
+
 ## `Trace<E>` type
 
 This crate depends on the [`trace-error`](https://crates.io/crates/trace-error) crate to have simple and lightweight backtraces on all error `Result`s.
@@ -50,7 +78,7 @@ all the `emit*` methods.
 
 ```toml
 [dependencies.parallel-event-emitter]
-version = "0.1.2"
+version = "0.2.0"
 features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 ```
 
@@ -63,6 +91,6 @@ To enable true 64-bit counters, use the `integer_atomics` feature for the crate
 
 ```toml
 [dependencies.parallel-event-emitter]
-version = "0.1.2"
+version = "0.2.0"
 features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 ```
