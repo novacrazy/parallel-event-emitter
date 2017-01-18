@@ -166,14 +166,14 @@ impl ParallelEventEmitter {
         }
     }
 
-    fn add_listener_impl(&mut self, event: String, cb: SyncCallback) -> EventResult<u64> {
+    fn add_listener_impl<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: FnMut(u64, Option<ArcCowish>) -> EventResult<bool> + 'static {
         match try_throw!(self.inner.events.write()).entry(event) {
             Entry::Occupied(listeners_lock) => {
                 let mut listeners = try_throw!(listeners_lock.get().write());
 
                 let id = self.inner.counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-                listeners.push(SyncEventListener::new(id, cb));
+                listeners.push(SyncEventListener::new(id, Box::new(cb)));
 
                 Ok(id)
             },
@@ -182,7 +182,7 @@ impl ParallelEventEmitter {
 
                 let id = self.inner.counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-                listeners.push(SyncEventListener::new(id, cb));
+                listeners.push(SyncEventListener::new(id, Box::new(cb)));
 
                 vacant.insert(Arc::new(RwLock::new(listeners)));
 
@@ -191,22 +191,16 @@ impl ParallelEventEmitter {
         }
     }
 
-    /// Add a simple listener callback that does not accept any arguments
-    ///
-    /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
     #[inline]
-    pub fn add_listener<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
-        self.add_listener_impl(event.into(), Box::new(move |_, _| -> EventResult<bool> { cb().map(ran) }))
+    fn add_listener_impl_simple<F>(&mut self, event: String, mut cb: F) -> EventResult<u64> where F: FnMut(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
+        self.add_listener_impl(event, move |id, arg| cb(id, arg).map(ran))
     }
 
-    /// Like `add_listener`, but the listener will be removed from the event emitter after a single invocation.
-    pub fn once<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
-        let event = event.into();
-
+    fn once_impl<F>(&mut self, event: String, mut cb: F) -> EventResult<u64> where F: FnMut(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
         // A weak reference is used so that the self-reference from with the listener table doesn't create a circular reference
         let inner_weak = Arc::downgrade(&self.inner);
 
-        self.add_listener_impl(event.clone(), Box::new(move |id, _| -> EventResult<bool> {
+        self.add_listener_impl(event.clone(), move |id, arg| -> EventResult<bool> {
             let inner = inner_weak.upgrade().expect("Listener invoked after owning ParallelEventEmitter was dropped");
 
             // Perform the removal before the callback is invoked, so in case it panics or takes a long time to complete it will have already been removed.
@@ -231,8 +225,22 @@ impl ParallelEventEmitter {
                 }
             }
 
-            cb().map(ran)
-        }))
+            cb(id, arg).map(ran)
+        })
+    }
+
+    /// Add a simple listener callback that does not accept any arguments
+    ///
+    /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
+    #[inline]
+    pub fn add_listener<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
+        self.add_listener_impl_simple(event.into(), move |_, _| -> EventResult<()> { cb() })
+    }
+
+    /// Like `add_listener`, but the listener will be removed from the event emitter after a single invocation.
+    #[inline]
+    pub fn once<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
+        self.once_impl(event.into(), move |_, _| cb())
     }
 
     /// Add a listener that can accept a value passed via `emit_value`, or `emit_value_sync` if `T` is `Clone`
@@ -241,79 +249,50 @@ impl ParallelEventEmitter {
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
     pub fn add_listener_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
-        self.add_listener_impl(event.into(), Box::new(move |_, arg: Option<ArcCowish>| -> EventResult<bool> {
+        self.add_listener_impl_simple(event.into(), move |_, arg: Option<ArcCowish>| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
                     ArcCowish::Borrowed(value) => {
                         // If the value is borrowed, but T is Clone, we can clone a unique value
                         if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(value.clone())).map(ran);
+                            return cb(Some(value.clone()));
                         }
                     }
                     ArcCowish::Owned(value) => {
                         // If it's owned, we just dereference it directly.
                         if let Ok(value) = value.downcast::<T>() {
-                            return cb(Some(*value)).map(ran);
+                            return cb(Some(*value));
                         }
                     }
                 }
             }
 
-            cb(None).map(ran)
-        }))
+            cb(None)
+        })
     }
 
     /// Like `add_listener_value`, but the listener will be removed from the event emitter after a single invocation.
     pub fn once_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
-        let event = event.into();
-
-        // A weak reference is used so that the self-reference from with the listener table doesn't create a circular reference
-        let inner_weak = Arc::downgrade(&self.inner);
-
-        self.add_listener_impl(event.clone(), Box::new(move |id, arg| -> EventResult<bool> {
-            let inner = inner_weak.upgrade().expect("Listener invoked after owning ParallelEventEmitter was dropped");
-
-            // Perform the removal before the callback is invoked, so in case it panics or takes a long time to complete it will have already been removed.
-            {
-                match try_throw!(inner.events.write()).entry(event.clone()) {
-                    Entry::Occupied(listeners_lock) => {
-                        let mut listeners = try_throw!(listeners_lock.get().write());
-
-                        if let Ok(index) = listeners.binary_search_by_key(&id, |listener| listener.id) {
-                            listeners.remove(index);
-                        } else {
-                            // If the listener has already been removed in the short time between emitting and this,
-                            // just forget we were here and return ok.
-                            return Ok(false);
-                        }
-                    }
-                    Entry::Vacant(_) => {
-                        // If the listener has already been removed in the short time between emitting and this,
-                        // just forget we were here and return ok.
-                        return Ok(false);
-                    }
-                }
-            }
-
+        self.once_impl(event.into(), move |_, arg| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
                     ArcCowish::Borrowed(value) => {
                         // If the value is borrowed, but T is Clone, we can clone a unique value
                         if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(value.clone())).map(ran);
+                            return cb(Some(value.clone()));
                         }
                     }
                     ArcCowish::Owned(value) => {
                         // If it's owned, we just dereference it directly.
                         if let Ok(value) = value.downcast::<T>() {
-                            return cb(Some(*value)).map(ran);
+                            return cb(Some(*value));
                         }
                     }
                 }
             }
 
-            cb(None).map(ran)
-        }))
+            cb(None)
+        })
     }
 
     /// Variation of `add_listener_value` that accepts `Sync` types,
@@ -329,79 +308,50 @@ impl ParallelEventEmitter {
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
     pub fn add_listener_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
-        self.add_listener_impl(event.into(), Box::new(move |_, arg: Option<ArcCowish>| -> EventResult<bool> {
+        self.add_listener_impl_simple(event.into(), move |_, arg: Option<ArcCowish>| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
                     ArcCowish::Borrowed(value) => {
                         // If the value is borrowed, return return a reference to the local copy
                         if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value)).map(ran);
+                            return cb(Some(&*value));
                         }
                     }
                     ArcCowish::Owned(value) => {
                         // If it's owned, do the same thing, although it'll reference the original copy
                         if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value)).map(ran);
+                            return cb(Some(&*value));
                         }
                     }
                 }
             }
 
-            cb(None).map(ran)
-        }))
+            cb(None)
+        })
     }
 
     /// Like `add_listener_sync`, but the listener will be removed from the event emitter after a single invocation.
     pub fn once_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
-        let event = event.into();
-
-        // A weak reference is used so that the self-reference from with the listener table doesn't create a circular reference
-        let inner_weak = Arc::downgrade(&self.inner);
-
-        self.add_listener_impl(event.clone(), Box::new(move |id, arg| -> EventResult<bool> {
-            let inner = inner_weak.upgrade().expect("Listener invoked after owning ParallelEventEmitter was dropped");
-
-            // Perform the removal before the callback is invoked, so in case it panics or takes a long time to complete it will have already been removed.
-            {
-                match try_throw!(inner.events.write()).entry(event.clone()) {
-                    Entry::Occupied(listeners_lock) => {
-                        let mut listeners = try_throw!(listeners_lock.get().write());
-
-                        if let Ok(index) = listeners.binary_search_by_key(&id, |listener| listener.id) {
-                            listeners.remove(index);
-                        } else {
-                            // If the listener has already been removed in the short time between emitting and this,
-                            // just forget we were here and return ok.
-                            return Ok(false);
-                        }
-                    }
-                    Entry::Vacant(_) => {
-                        // If the listener has already been removed in the short time between emitting and this,
-                        // just forget we were here and return ok.
-                        return Ok(false);
-                    }
-                }
-            }
-
+        self.once_impl(event.into(), move |_, arg| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
                     ArcCowish::Borrowed(value) => {
                         // If the value is borrowed, return return a reference to the local copy
                         if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value)).map(ran);
+                            return cb(Some(&*value));
                         }
                     }
                     ArcCowish::Owned(value) => {
                         // If it's owned, do the same thing, although it'll reference the original copy
                         if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value)).map(ran);
+                            return cb(Some(&*value));
                         }
                     }
                 }
             }
 
-            cb(None).map(ran)
-        }))
+            cb(None)
+        })
     }
 
     /// Removes a listener with the given ID and associated with the given event.
