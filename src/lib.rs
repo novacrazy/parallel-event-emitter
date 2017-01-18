@@ -166,7 +166,30 @@ impl ParallelEventEmitter {
         }
     }
 
-    fn add_listener_impl<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: FnMut(u64, Option<ArcCowish>) -> EventResult<bool> + 'static {
+    /// Collect the names of all events being listened for.
+    ///
+    /// Unfortunately, this method locks a mutex on an internal structure,
+    /// so an iterator cannot be returned.
+    pub fn event_names(&self) -> EventResult<Vec<String>> {
+        let guard = try_throw!(self.inner.events.read());
+
+        Ok(guard.keys().cloned().collect())
+    }
+
+    /// As an alternative to cloning all the event names and collecting them into a `Vec`,
+    /// like in `event_names`,
+    /// a visitor callback can be used to iterate all the event names more efficiently.
+    pub fn event_names_visitor<F>(&self, visitor: F) -> EventResult<()> where F: Fn(&String) {
+        let guard = try_throw!(self.inner.events.read());
+
+        for key in guard.keys() {
+            visitor(key);
+        }
+
+        Ok(())
+    }
+
+    fn add_listener_impl<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: Fn(u64, Option<ArcCowish>) -> EventResult<bool> + 'static {
         match try_throw!(self.inner.events.write()).entry(event) {
             Entry::Occupied(listeners_lock) => {
                 let mut listeners = try_throw!(listeners_lock.get().write());
@@ -192,11 +215,11 @@ impl ParallelEventEmitter {
     }
 
     #[inline]
-    fn add_listener_impl_simple<F>(&mut self, event: String, mut cb: F) -> EventResult<u64> where F: FnMut(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
+    fn add_listener_impl_simple<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: Fn(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
         self.add_listener_impl(event, move |id, arg| cb(id, arg).map(ran))
     }
 
-    fn once_impl<F>(&mut self, event: String, mut cb: F) -> EventResult<u64> where F: FnMut(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
+    fn once_impl<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: Fn(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
         // A weak reference is used so that the self-reference from with the listener table doesn't create a circular reference
         let inner_weak = Arc::downgrade(&self.inner);
 
