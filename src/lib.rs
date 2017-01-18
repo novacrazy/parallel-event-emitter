@@ -12,7 +12,7 @@
 //! ```toml
 //! [dependencies]
 //! futures = "0.1"
-//! parallel-event-emitter = "0.1.1"
+//! parallel-event-emitter = "0.1.2"
 //! ```
 //!
 //! ```rust
@@ -49,7 +49,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.1.1"
+//! version = "0.1.2"
 //! features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 //! ```
 //!
@@ -62,7 +62,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.1.1"
+//! version = "0.1.2"
 //! features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 //! ```
 //!
