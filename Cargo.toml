@@ -1,7 +1,13 @@
 [package]
-authors = ["Aaron Trent <novacrazy@gmail.com>"]
 name = "parallel-event-emitter"
+authors = ["Aaron Trent <novacrazy@gmail.com>"]
+description = "Parallel Event Emitter for concurrent listener invocation based on futures-rs and futures-cpupool"
+repository = "https://github.com/novacrazy/parallel-event-emitter"
+readme = "README.md"
 version = "0.1.0"
+license = "MIT"
+keywords = ["event", "emitter", "parallel", "futures"]
+documentation = "https://docs.rs/parallel-event-emitter/"
 
 [dependencies]
 fnv = "1.0.5"
@@ -13,4 +19,5 @@ trace-error = "0.1.2"
 thread-id = "3.0.0"
 
 [features]
+default = []
 conservative_impl_trait = []

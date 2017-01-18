@@ -50,7 +50,7 @@
 //! ```toml
 //! [dependencies.parallel-event-emitter]
 //! version = "0.1.0"
-//! features = ["conservative_impl_trait"]
+//! features = ["default", "conservative_impl_trait"]
 //! ```
 
 #![cfg_attr(feature = "conservative_impl_trait", feature(conservative_impl_trait))]
