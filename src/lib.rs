@@ -103,59 +103,218 @@ pub mod error;
 
 pub use self::error::*;
 
-// This allows callbacks to take both values and references depending on the situation
-enum ArcCowish {
-    Owned(Box<Any>),
-    Borrowed(Arc<Box<Any>>),
-}
+/// The internal module defines non-public functionality.
+/// 
+/// By putting most of it in its own module it helps with organization.
+mod internal {
+    use super::*;
 
-/// Integer type used to represent unique listener ids
-pub type ListenerId = u64;
+    // This allows callbacks to take both values and references depending on the situation
+    pub enum ArcCowish {
+        Owned(Box<Any>),
+        Borrowed(Arc<Box<Any>>),
+    }
 
-/// This handler callback takes the listener id and the argument,
-/// and returns `Ok(true)` if the listener callback was invoked correctly.
-type SyncCallback = Box<FnMut(ListenerId, Option<ArcCowish>) -> EventResult<bool>>;
+    /// This handler callback takes the listener id and the argument,
+    /// and returns `Ok(true)` if the listener callback was invoked correctly.
+    pub type SyncCallback = Box<FnMut(ListenerId, Option<ArcCowish>) -> EventResult<bool>>;
 
-// Stores the listener callback and its ID value
-//
-// The odd order of locks and `Arc`s is due to needing to access the `id` field without locking
-struct SyncEventListener {
-    id: ListenerId,
-    cb: RwLock<SyncCallback>,
-}
+    // Stores the listener callback and its ID value
+    //
+    // The odd order of locks and `Arc`s is due to needing to access the `id` field without locking
+    pub struct SyncEventListener {
+        pub id: ListenerId,
+        pub cb: RwLock<SyncCallback>,
+    }
 
-unsafe impl Send for SyncEventListener {}
+    unsafe impl Send for SyncEventListener {}
 
-unsafe impl Sync for SyncEventListener {}
+    unsafe impl Sync for SyncEventListener {}
 
-impl SyncEventListener {
-    /// Create a new `SyncEventListener` from an id and callback
-    fn new(id: ListenerId, cb: SyncCallback) -> Arc<SyncEventListener> {
-        Arc::new(SyncEventListener { id: id, cb: RwLock::new(cb) })
+    impl SyncEventListener {
+        /// Create a new `SyncEventListener` from an id and callback
+        pub fn new(id: ListenerId, cb: SyncCallback) -> Arc<SyncEventListener> {
+            Arc::new(SyncEventListener { id: id, cb: RwLock::new(cb) })
+        }
+    }
+
+    pub type SyncEventListenerLock = Arc<SyncEventListener>;
+
+    pub type SyncListenersLock = Arc<RwLock<Vec<SyncEventListenerLock>>>;
+
+    /// Inner structure that can be referenced from within the threadpool and listener callbacks
+    pub struct Inner {
+        pub events: RwLock<FnvHashMap<String, SyncListenersLock>>,
+        pub counter: AtomicListenerId,
+        pub pool: CpuPool,
+    }
+
+    unsafe impl Send for Inner {}
+
+    unsafe impl Sync for Inner {}
+
+    /// Internal function used in callbacks in `add_listener_value` and `once_value`
+    pub fn invoke_value_cb<T, F>(arg: Option<ArcCowish>, cb: &F) -> EventResult<()> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
+        if let Some(arg) = arg {
+            match arg {
+                ArcCowish::Borrowed(value) => {
+                    // If the value is borrowed, but T is Clone, we can clone a unique value
+                    if let Some(value) = value.downcast_ref::<T>() {
+                        return cb(Some(value.clone()));
+                    }
+                }
+                ArcCowish::Owned(value) => {
+                    // If it's owned, we just dereference it directly.
+                    if let Ok(value) = value.downcast::<T>() {
+                        return cb(Some(*value));
+                    }
+                }
+            }
+        }
+
+        cb(None)
+    }
+
+    /// Internal function used in callbacks in `add_listener_sync` and `once_sync`
+    pub fn invoke_sync_cb<T, F>(arg: Option<ArcCowish>, cb: &F) -> EventResult<()> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
+        if let Some(arg) = arg {
+            match arg {
+                ArcCowish::Borrowed(value) => {
+                    // If the value is borrowed, use the reference to the original copy
+                    if let Some(value) = value.downcast_ref::<T>() {
+                        return cb(Some(&*value));
+                    }
+                }
+                ArcCowish::Owned(value) => {
+                    // If it's owned, do the same, but just use a reference to the local copy
+                    if let Some(value) = value.downcast_ref::<T>() {
+                        return cb(Some(&*value));
+                    }
+                }
+            }
+        }
+
+        cb(None)
+    }
+
+    /// Internal function to facilitate in spawning the listener callback tasks for `emit`
+    pub fn emit_spawn(inner: Arc<Inner>, event: String) -> EventResult<BoxFuture<usize, Trace<EventError>>> {
+        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
+            let listeners = try_throw!(listeners_lock.read());
+
+            // Don't bother if there aren't any listeners to invoke anyway
+            if listeners.len() > 0 {
+                let mut listener_futures = Vec::with_capacity(listeners.len());
+
+                for listener in listeners.iter() {
+                    // Clone a local copy of the listener that can be sent to the spawn
+                    let listener = listener.clone();
+
+                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
+                        let mut cb_guard = try_throw!(listener.cb.write());
+
+                        // Force a mutable reference to the callback
+                        (&mut *cb_guard)(listener.id, None)
+                    });
+
+                    listener_futures.push(listener_future);
+                }
+
+                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
+            }
+        }
+
+        Ok(futures::finished(0).boxed())
+    }
+
+    /// Internal function to facilitate in spawning the listener callback tasks for `emit_value`
+    pub fn emit_value_spawn<T>(inner: Arc<Inner>, event: String, value: T) -> EventResult<BoxFuture<usize, Trace<EventError>>> where T: Any + Clone + Send {
+        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
+            let listeners = try_throw!(listeners_lock.read());
+
+            // Don't bother if there aren't any listeners to invoke anyway
+            if listeners.len() > 0 {
+                let mut listener_futures = Vec::with_capacity(listeners.len());
+
+                for listener in listeners.iter() {
+                    // Clone a local copy of the listener that can be sent to the spawn
+                    let listener = listener.clone();
+
+                    // Clone a local copy of value that can be sent to the listener
+                    let value = value.clone();
+
+                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
+                        let mut cb_guard = try_throw!(listener.cb.write());
+
+                        // Force a mutable reference to the callback
+                        (&mut *cb_guard)(listener.id, Some(ArcCowish::Owned(Box::new(value))))
+                    });
+
+                    listener_futures.push(listener_future);
+                }
+
+                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
+            }
+        }
+
+        Ok(futures::finished(0).boxed())
+    }
+
+    /// Internal function to facilitate in spawning the listener callback tasks for `emit_value_sync`
+    pub fn emit_value_sync_spawn<T>(inner: Arc<Inner>, event: String, value: T) -> EventResult<BoxFuture<usize, Trace<EventError>>> where T: Any + Send + Sync {
+        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
+            let listeners = try_throw!(listeners_lock.read());
+
+            // Don't bother if there aren't any listeners to invoke anyway
+            if listeners.len() > 0 {
+                let mut listener_futures = Vec::with_capacity(listeners.len());
+
+                // We know T is Send, and Box<Any> is really just Box<T>, so it is Send as well
+                #[derive(Clone)]
+                struct SendWrapper {
+                    inner: Arc<Box<Any>>
+                }
+
+                unsafe impl Send for SendWrapper {}
+
+                // Use let binding to coerce value into Any
+                let wrapper = SendWrapper { inner: Arc::new(Box::new(value)) };
+
+                for listener in listeners.iter() {
+                    // Clone a local copy of the listener that can be sent to the spawn
+                    let listener = listener.clone();
+
+                    let wrapper = wrapper.clone();
+
+                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
+                        let mut cb_guard = try_throw!(listener.cb.write());
+
+                        // Force a mutable reference to the callback
+                        (&mut *cb_guard)(listener.id, Some(ArcCowish::Borrowed(wrapper.inner)))
+                    });
+
+                    listener_futures.push(listener_future);
+                }
+
+                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
+            }
+        }
+
+        Ok(futures::finished(0).boxed())
     }
 }
 
-type SyncEventListenerLock = Arc<SyncEventListener>;
+use internal::{Inner, ArcCowish, SyncEventListener};
 
-type SyncListenersLock = Arc<RwLock<Vec<SyncEventListenerLock>>>;
+/// Integer type used to represent unique listener ids
+pub type ListenerId = u64;
 
 /// Parallel Event Emitter
 ///
 /// Listeners added to the emitter will be invoked in a thread pool concurrently.
 pub struct ParallelEventEmitter {
-    inner: Arc<Inner>,
+    inner: Arc<internal::Inner>,
 }
-
-/// Inner structure that can be referenced from within the threadpool and listener callbacks
-struct Inner {
-    events: RwLock<FnvHashMap<String, SyncListenersLock>>,
-    counter: AtomicListenerId,
-    pool: CpuPool,
-}
-
-unsafe impl Send for Inner {}
-
-unsafe impl Sync for Inner {}
 
 impl Default for ParallelEventEmitter {
     fn default() -> ParallelEventEmitter {
@@ -302,51 +461,15 @@ impl ParallelEventEmitter {
     /// If no value or an incompatible value was passed to `emit*`, `None` is passed.
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
+    #[inline]
     pub fn add_listener_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
-        self.add_listener_impl_simple(event.into(), move |_, arg: Option<ArcCowish>| -> EventResult<()> {
-            if let Some(arg) = arg {
-                match arg {
-                    ArcCowish::Borrowed(value) => {
-                        // If the value is borrowed, but T is Clone, we can clone a unique value
-                        if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(value.clone()));
-                        }
-                    }
-                    ArcCowish::Owned(value) => {
-                        // If it's owned, we just dereference it directly.
-                        if let Ok(value) = value.downcast::<T>() {
-                            return cb(Some(*value));
-                        }
-                    }
-                }
-            }
-
-            cb(None)
-        })
+        self.add_listener_impl_simple(event.into(), move |_, arg| internal::invoke_value_cb::<T, F>(arg, &cb))
     }
 
     /// Like `add_listener_value`, but the listener will be removed from the event emitter after a single invocation.
+    #[inline]
     pub fn once_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
-        self.once_impl(event.into(), move |_, arg| -> EventResult<()> {
-            if let Some(arg) = arg {
-                match arg {
-                    ArcCowish::Borrowed(value) => {
-                        // If the value is borrowed, but T is Clone, we can clone a unique value
-                        if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(value.clone()));
-                        }
-                    }
-                    ArcCowish::Owned(value) => {
-                        // If it's owned, we just dereference it directly.
-                        if let Ok(value) = value.downcast::<T>() {
-                            return cb(Some(*value));
-                        }
-                    }
-                }
-            }
-
-            cb(None)
-        })
+        self.once_impl(event.into(), move |_, arg| internal::invoke_value_cb::<T, F>(arg, &cb))
     }
 
     /// Variation of `add_listener_value` that accepts `Sync` types,
@@ -361,51 +484,15 @@ impl ParallelEventEmitter {
     /// or if you want to avoid cloning values all over the place.
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
+    #[inline]
     pub fn add_listener_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
-        self.add_listener_impl_simple(event.into(), move |_, arg: Option<ArcCowish>| -> EventResult<()> {
-            if let Some(arg) = arg {
-                match arg {
-                    ArcCowish::Borrowed(value) => {
-                        // If the value is borrowed, use the reference to the original copy
-                        if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value));
-                        }
-                    }
-                    ArcCowish::Owned(value) => {
-                        // If it's owned, do the same, but just use a reference to the local copy
-                        if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value));
-                        }
-                    }
-                }
-            }
-
-            cb(None)
-        })
+        self.add_listener_impl_simple(event.into(), move |_, arg| internal::invoke_sync_cb::<T, F>(arg, &cb))
     }
 
     /// Like `add_listener_sync`, but the listener will be removed from the event emitter after a single invocation.
+    #[inline]
     pub fn once_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
-        self.once_impl(event.into(), move |_, arg| -> EventResult<()> {
-            if let Some(arg) = arg {
-                match arg {
-                    ArcCowish::Borrowed(value) => {
-                        // If the value is borrowed, use the reference to the original copy
-                        if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value));
-                        }
-                    }
-                    ArcCowish::Owned(value) => {
-                        // If it's owned, do the same, but just use a reference to the local copy
-                        if let Some(value) = value.downcast_ref::<T>() {
-                            return cb(Some(&*value));
-                        }
-                    }
-                }
-            }
-
-            cb(None)
-        })
+        self.once_impl(event.into(), move |_, arg| internal::invoke_sync_cb::<T, F>(arg, &cb))
     }
 
     /// Removes a listener with the given ID and associated with the given event.
@@ -446,112 +533,6 @@ impl ParallelEventEmitter {
         Ok(false)
     }
 
-    /// Internal function to facilitate in spawning the listener callback tasks for `emit`
-    fn emit_spawn(inner: Arc<Inner>, event: String) -> EventResult<BoxFuture<usize, Trace<EventError>>> {
-        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-            let listeners = try_throw!(listeners_lock.read());
-
-            // Don't bother if there aren't any listeners to invoke anyway
-            if listeners.len() > 0 {
-                let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                for listener in listeners.iter() {
-                    // Clone a local copy of the listener that can be sent to the spawn
-                    let listener = listener.clone();
-
-                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                        let mut cb_guard = try_throw!(listener.cb.write());
-
-                        // Force a mutable reference to the callback
-                        (&mut *cb_guard)(listener.id, None)
-                    });
-
-                    listener_futures.push(listener_future);
-                }
-
-                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
-            }
-        }
-
-        Ok(futures::finished(0).boxed())
-    }
-
-    /// Internal function to facilitate in spawning the listener callback tasks for `emit_value`
-    fn emit_value_spawn<T>(inner: Arc<Inner>, event: String, value: T) -> EventResult<BoxFuture<usize, Trace<EventError>>> where T: Any + Clone + Send {
-        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-            let listeners = try_throw!(listeners_lock.read());
-
-            // Don't bother if there aren't any listeners to invoke anyway
-            if listeners.len() > 0 {
-                let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                for listener in listeners.iter() {
-                    // Clone a local copy of the listener that can be sent to the spawn
-                    let listener = listener.clone();
-
-                    // Clone a local copy of value that can be sent to the listener
-                    let value = value.clone();
-
-                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                        let mut cb_guard = try_throw!(listener.cb.write());
-
-                        // Force a mutable reference to the callback
-                        (&mut *cb_guard)(listener.id, Some(ArcCowish::Owned(Box::new(value))))
-                    });
-
-                    listener_futures.push(listener_future);
-                }
-
-                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
-            }
-        }
-
-        Ok(futures::finished(0).boxed())
-    }
-
-    /// Internal function to facilitate in spawning the listener callback tasks for `emit_value_sync`
-    fn emit_value_sync_spawn<T>(inner: Arc<Inner>, event: String, value: T) -> EventResult<BoxFuture<usize, Trace<EventError>>> where T: Any + Send + Sync {
-        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-            let listeners = try_throw!(listeners_lock.read());
-
-            // Don't bother if there aren't any listeners to invoke anyway
-            if listeners.len() > 0 {
-                let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                // We know T is Send, and Box<Any> is really just Box<T>, so it is Send as well
-                #[derive(Clone)]
-                struct SendWrapper {
-                    inner: Arc<Box<Any>>
-                }
-
-                unsafe impl Send for SendWrapper {}
-
-                // Use let binding to coerce value into Any
-                let wrapper = SendWrapper { inner: Arc::new(Box::new(value)) };
-
-                for listener in listeners.iter() {
-                    // Clone a local copy of the listener that can be sent to the spawn
-                    let listener = listener.clone();
-
-                    let wrapper = wrapper.clone();
-
-                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                        let mut cb_guard = try_throw!(listener.cb.write());
-
-                        // Force a mutable reference to the callback
-                        (&mut *cb_guard)(listener.id, Some(ArcCowish::Borrowed(wrapper.inner)))
-                    });
-
-                    listener_futures.push(listener_future);
-                }
-
-                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
-            }
-        }
-
-        Ok(futures::finished(0).boxed())
-    }
-
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
     ///
     /// The `Future` returned by `emit` resolves to the number of listeners invoked,
@@ -561,7 +542,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_spawn(inner, event)).flatten()
+        self.inner.pool.spawn_fn(move || internal::emit_spawn(inner, event)).flatten()
     }
 
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
@@ -573,7 +554,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_spawn(inner, event)).flatten().boxed()
+        self.inner.pool.spawn_fn(move || internal::emit_spawn(inner, event)).flatten().boxed()
     }
 
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
@@ -587,7 +568,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_spawn(inner, event, value)).flatten()
+        self.inner.pool.spawn_fn(move || internal::emit_value_spawn(inner, event, value)).flatten()
     }
 
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
@@ -601,7 +582,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_spawn(inner, event, value)).flatten().boxed()
+        self.inner.pool.spawn_fn(move || internal::emit_value_spawn(inner, event, value)).flatten().boxed()
     }
 
     /// Variation of `emit_value` for `Sync` types, where intermediate copies are unnecessary.
@@ -615,7 +596,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_sync_spawn(inner, event, value)).flatten()
+        self.inner.pool.spawn_fn(move || internal::emit_value_sync_spawn(inner, event, value)).flatten()
     }
 
     /// Variation of `emit_value` for `Sync` types, where intermediate copies are unnecessary.
@@ -629,6 +610,6 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_sync_spawn(inner, event, value)).flatten().boxed()
+        self.inner.pool.spawn_fn(move || internal::emit_value_sync_spawn(inner, event, value)).flatten().boxed()
     }
 }
