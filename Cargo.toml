@@ -20,4 +20,5 @@ thread-id = "3.0.0"
 
 [features]
 default = []
+integer_atomics = []
 conservative_impl_trait = []

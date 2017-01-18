@@ -7,7 +7,7 @@
 //!
 //! Additionally, all types `T` must be `Any`, so `T: 'static`.
 //!
-//! ### Usage
+//! ## Usage
 //!
 //! ```toml
 //! [dependencies]
@@ -35,13 +35,13 @@
 //! }
 //! ```
 //!
-//! ### `Trace<E>` type
+//! ## `Trace<E>` type
 //!
 //! This crate depends on the [`trace-error`](https://crates.io/crates/trace-error) crate to have simple and lightweight backtraces on all error `Result`s.
 //!
 //! If you choose not to use that, which is fine by me, simply call `.into_error()` on all `Trace<E>` values to get the real error.
 //!
-//! ### `impl Trait` feature
+//! ## `impl Trait` feature
 //!
 //! Instead of having all the `emit*` methods returning a boxed `Future` (`BoxFuture`),
 //! the Cargo feature **`conservative_impl_trait`** can be given to enable `impl Future` return types on
@@ -50,12 +50,28 @@
 //! ```toml
 //! [dependencies.parallel-event-emitter]
 //! version = "0.1.0"
-//! features = ["default", "conservative_impl_trait"]
+//! features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 //! ```
+//!
+//! ## Larger `ListenerId`s
+//!
+//! Although the `ListenerId` type itself is `u64`,
+//! the atomic counter underneath is restricted to `AtomicUsize` by default.
+//!
+//! To enable true guaranteed 64-bit counters, use the `integer_atomics` feature for the crate.
+//!
+//! ```toml
+//! [dependencies.parallel-event-emitter]
+//! version = "0.1.0"
+//! features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
+//! ```
+//!
 
-#![cfg_attr(feature = "conservative_impl_trait", feature(conservative_impl_trait))]
 #![deny(missing_docs)]
 #![allow(unknown_lints)]
+
+#![cfg_attr(feature = "integer_atomics", feature(integer_atomics))]
+#![cfg_attr(feature = "conservative_impl_trait", feature(conservative_impl_trait))]
 
 extern crate fnv;
 
@@ -66,7 +82,14 @@ extern crate futures_cpupool;
 
 use std::any::Any;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+use std::sync::atomic::Ordering;
+
+#[cfg(feature = "integer_atomics")]
+use std::sync::atomic::AtomicListenerId as AtomicListenerId;
+
+#[cfg(not(feature = "integer_atomics"))]
+use std::sync::atomic::AtomicUsize as AtomicListenerId;
 
 use fnv::FnvHashMap;
 use std::collections::hash_map::Entry;
@@ -89,15 +112,18 @@ enum ArcCowish {
     Borrowed(Arc<Box<Any>>),
 }
 
+/// Integer type used to represent unique listener ids
+pub type ListenerId = u64;
+
 /// This handler callback takes the listener id and the argument,
 /// and returns `Ok(true)` if the listener callback was invoked correctly.
-type SyncCallback = Box<FnMut(u64, Option<ArcCowish>) -> EventResult<bool>>;
+type SyncCallback = Box<FnMut(ListenerId, Option<ArcCowish>) -> EventResult<bool>>;
 
 // Stores the listener callback and its ID value
 //
 // The odd order of locks and `Arc`s is due to needing to access the `id` field without locking
 struct SyncEventListener {
-    id: u64,
+    id: ListenerId,
     cb: RwLock<SyncCallback>,
 }
 
@@ -107,7 +133,7 @@ unsafe impl Sync for SyncEventListener {}
 
 impl SyncEventListener {
     /// Create a new `SyncEventListener` from an id and callback
-    fn new(id: u64, cb: SyncCallback) -> Arc<SyncEventListener> {
+    fn new(id: ListenerId, cb: SyncCallback) -> Arc<SyncEventListener> {
         Arc::new(SyncEventListener { id: id, cb: RwLock::new(cb) })
     }
 }
@@ -126,7 +152,7 @@ pub struct ParallelEventEmitter {
 /// Inner structure that can be referenced from withing the threadpool and so forth
 struct Inner {
     events: RwLock<FnvHashMap<String, SyncListenersLock>>,
-    counter: AtomicUsize,
+    counter: AtomicListenerId,
     pool: CpuPool,
 }
 
@@ -160,7 +186,7 @@ impl ParallelEventEmitter {
         ParallelEventEmitter {
             inner: Arc::new(Inner {
                 events: RwLock::new(FnvHashMap::default()),
-                counter: AtomicUsize::new(0),
+                counter: AtomicListenerId::new(0),
                 pool: pool,
             })
         }
@@ -189,12 +215,12 @@ impl ParallelEventEmitter {
         Ok(())
     }
 
-    fn add_listener_impl<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: Fn(u64, Option<ArcCowish>) -> EventResult<bool> + 'static {
+    fn add_listener_impl<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<bool> + 'static {
         match try_throw!(self.inner.events.write()).entry(event) {
             Entry::Occupied(listeners_lock) => {
                 let mut listeners = try_throw!(listeners_lock.get().write());
 
-                let id = self.inner.counter.fetch_add(1, Ordering::Relaxed) as u64;
+                let id = self.inner.counter.fetch_add(1, Ordering::Relaxed) as ListenerId;
 
                 listeners.push(SyncEventListener::new(id, Box::new(cb)));
 
@@ -203,7 +229,7 @@ impl ParallelEventEmitter {
             Entry::Vacant(vacant) => {
                 let mut listeners = Vec::with_capacity(1);
 
-                let id = self.inner.counter.fetch_add(1, Ordering::Relaxed) as u64;
+                let id = self.inner.counter.fetch_add(1, Ordering::Relaxed) as ListenerId;
 
                 listeners.push(SyncEventListener::new(id, Box::new(cb)));
 
@@ -215,11 +241,11 @@ impl ParallelEventEmitter {
     }
 
     #[inline]
-    fn add_listener_impl_simple<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: Fn(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
+    fn add_listener_impl_simple<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<()> + 'static {
         self.add_listener_impl(event, move |id, arg| cb(id, arg).map(ran))
     }
 
-    fn once_impl<F>(&mut self, event: String, cb: F) -> EventResult<u64> where F: Fn(u64, Option<ArcCowish>) -> EventResult<()> + 'static {
+    fn once_impl<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<()> + 'static {
         // A weak reference is used so that the self-reference from with the listener table doesn't create a circular reference
         let inner_weak = Arc::downgrade(&self.inner);
 
@@ -256,13 +282,13 @@ impl ParallelEventEmitter {
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
     #[inline]
-    pub fn add_listener<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
+    pub fn add_listener<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where F: Fn() -> EventResult<()> + 'static {
         self.add_listener_impl_simple(event.into(), move |_, _| -> EventResult<()> { cb() })
     }
 
     /// Like `add_listener`, but the listener will be removed from the event emitter after a single invocation.
     #[inline]
-    pub fn once<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
+    pub fn once<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where F: Fn() -> EventResult<()> + 'static {
         self.once_impl(event.into(), move |_, _| cb())
     }
 
@@ -271,7 +297,7 @@ impl ParallelEventEmitter {
     /// If no value or an incompatible value was passed to `emit*`, `None` is passed.
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
-    pub fn add_listener_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
+    pub fn add_listener_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
         self.add_listener_impl_simple(event.into(), move |_, arg: Option<ArcCowish>| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
@@ -295,7 +321,7 @@ impl ParallelEventEmitter {
     }
 
     /// Like `add_listener_value`, but the listener will be removed from the event emitter after a single invocation.
-    pub fn once_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
+    pub fn once_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
         self.once_impl(event.into(), move |_, arg| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
@@ -330,7 +356,7 @@ impl ParallelEventEmitter {
     /// or if you want to avoid cloning values all over the place.
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
-    pub fn add_listener_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
+    pub fn add_listener_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
         self.add_listener_impl_simple(event.into(), move |_, arg: Option<ArcCowish>| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
@@ -354,7 +380,7 @@ impl ParallelEventEmitter {
     }
 
     /// Like `add_listener_sync`, but the listener will be removed from the event emitter after a single invocation.
-    pub fn once_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
+    pub fn once_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<ListenerId> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
         self.once_impl(event.into(), move |_, arg| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
@@ -382,7 +408,7 @@ impl ParallelEventEmitter {
     /// If the listener was not found (either doesn't exist or the wrong event given) `Ok(false)` is returned.
     ///
     /// If the listener was removed, `Ok(true)` is returned.
-    pub fn remove_listener<E: Into<String>>(&mut self, event: E, id: u64) -> EventResult<bool> {
+    pub fn remove_listener<E: Into<String>>(&mut self, event: E, id: ListenerId) -> EventResult<bool> {
         if let Some(listeners_lock) = try_throw!(self.inner.events.read()).get(&event.into()) {
             let mut listeners = try_throw!(listeners_lock.write());
 
@@ -399,7 +425,7 @@ impl ParallelEventEmitter {
     /// Exhaustively searches through ALL events for a listener with the given ID.
     ///
     /// `Ok(false)` is returned if it was not found.
-    pub fn remove_any_listener(&mut self, id: u64) -> EventResult<bool> {
+    pub fn remove_any_listener(&mut self, id: ListenerId) -> EventResult<bool> {
         for (_, listeners_lock) in try_throw!(self.inner.events.read()).iter() {
             let mut listeners = try_throw!(listeners_lock.write());
 

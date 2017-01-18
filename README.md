@@ -8,7 +8,7 @@ Because all values must be transferred across thread boundaries, all types `T` m
 
 Additionally, all types `T` must be `Any`, so `T: 'static`.
 
-### Usage
+## Usage
 
 ```toml
 [dependencies]
@@ -36,13 +36,13 @@ fn main() {
 }
 ```
 
-### `Trace<E>` type
+## `Trace<E>` type
 
 This crate depends on the [`trace-error`](https://crates.io/crates/trace-error) crate to have simple and lightweight backtraces on all error `Result`s.
 
 If you choose not to use that, which is fine by me, simply call `.into_error()` on all `Trace<E>` values to get the real error.
 
-### `impl Trait` feature
+## `impl Trait` feature
 
 Instead of having all the `emit*` methods returning a boxed `Future` (`BoxFuture`),
 the Cargo feature **`conservative_impl_trait`** can be given to enable `impl Future` return types on
@@ -51,5 +51,18 @@ all the `emit*` methods.
 ```toml
 [dependencies.parallel-event-emitter]
 version = "0.1.0"
-features = ["default", "conservative_impl_trait"]
+features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
+```
+
+## Larger `ListenerId`s
+
+Although the `ListenerId` type itself is `u64`,
+the atomic counter underneath is restricted to `AtomicUsize` by default.
+
+To enable true 64-bit counters, use the `integer_atomics` feature for the crate
+
+```toml
+[dependencies.parallel-event-emitter]
+version = "0.1.0"
+features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 ```
