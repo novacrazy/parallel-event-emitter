@@ -170,6 +170,11 @@ fn ran(_: ()) -> bool {
     true
 }
 
+/// Helper function to count successfully ran listeners
+fn count_ran(executed: Vec<bool>) -> usize {
+    executed.into_iter().filter(|ran| *ran).count()
+}
+
 impl ParallelEventEmitter {
     /// Creates a new `ParallelEventEmitter` with the default `CpuPool`
     pub fn new() -> ParallelEventEmitter {
@@ -464,8 +469,7 @@ impl ParallelEventEmitter {
                     listener_futures.push(listener_future);
                 }
 
-                return Ok(future::join_all(listener_futures)
-                    .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
+                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
             }
         }
 
@@ -498,8 +502,7 @@ impl ParallelEventEmitter {
                     listener_futures.push(listener_future);
                 }
 
-                return Ok(future::join_all(listener_futures)
-                    .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
+                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
             }
         }
 
@@ -542,8 +545,7 @@ impl ParallelEventEmitter {
                     listener_futures.push(listener_future);
                 }
 
-                return Ok(future::join_all(listener_futures)
-                    .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
+                return Ok(future::join_all(listener_futures).map(count_ran).boxed());
             }
         }
 
