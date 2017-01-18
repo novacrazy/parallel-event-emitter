@@ -15,6 +15,8 @@
 //! parallel-event-emitter = "0.2.0"
 //! ```
 //!
+//! Example using a `String` as the key:
+//!
 //! ```rust
 //! extern crate futures;
 //! extern crate parallel_event_emitter;

@@ -16,6 +16,8 @@ futures = "0.1"
 parallel-event-emitter = "0.2.0"
 ```
 
+Example using a `String` as the key:
+
 ```rust
 extern crate futures;
 extern crate parallel_event_emitter;
@@ -24,7 +26,7 @@ use futures::Future;
 use parallel_event_emitter::*;
 
 fn main() {
-    let mut emitter = ParallelEventEmitter::new();
+    let mut emitter: ParallelEventEmitter<String> = ParallelEventEmitter::new();
 
     emitter.add_listener("some event", || {
         println!("Hello, World!");
@@ -87,7 +89,7 @@ features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 Although the `ListenerId` type itself is `u64`,
 the atomic counter underneath is restricted to `AtomicUsize` by default.
 
-To enable true 64-bit counters, use the `integer_atomics` feature for the crate
+To enable true guaranteed 64-bit counters, use the `integer_atomics` feature for the crate.
 
 ```toml
 [dependencies.parallel-event-emitter]
