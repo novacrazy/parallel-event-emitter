@@ -55,6 +55,8 @@ fn main() {
 
     let d = emitter.emit_value_sync("some_sync", MyType::default());
 
+    println!("All events: {:?}", emitter.event_names().unwrap());
+
     let all = a.join4(b, c, d);
 
     assert_eq!(all.wait().unwrap(), (3, 3, 3, 4));
