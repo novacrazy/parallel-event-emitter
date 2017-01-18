@@ -215,6 +215,7 @@ impl ParallelEventEmitter {
         Ok(())
     }
 
+    /// Internal function that takes care of the listener vectors, generating new listener ids and inserting the new listener
     fn add_listener_impl<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<bool> + 'static {
         match try_throw!(self.inner.events.write()).entry(event) {
             Entry::Occupied(listeners_lock) => {
@@ -240,11 +241,13 @@ impl ParallelEventEmitter {
         }
     }
 
+    /// Simple wrapper around `add_listener_impl` that automatically maps the result to `ran`
     #[inline]
     fn add_listener_impl_simple<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<()> + 'static {
         self.add_listener_impl(event, move |id, arg| cb(id, arg).map(ran))
     }
 
+    /// Internal function that takes care of removing the listener for `once` listener callbacks
     fn once_impl<F>(&mut self, event: String, cb: F) -> EventResult<ListenerId> where F: Fn(ListenerId, Option<ArcCowish>) -> EventResult<()> + 'static {
         // A weak reference is used so that the self-reference from with the listener table doesn't create a circular reference
         let inner_weak = Arc::downgrade(&self.inner);
