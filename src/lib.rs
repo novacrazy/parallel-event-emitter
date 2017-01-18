@@ -12,7 +12,7 @@
 //! ```toml
 //! [dependencies]
 //! futures = "0.1"
-//! parallel-event-emitter = "0.1.0"
+//! parallel-event-emitter = "0.1.1"
 //! ```
 //!
 //! ```rust
@@ -49,7 +49,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.1.0"
+//! version = "0.1.1"
 //! features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 //! ```
 //!
@@ -62,7 +62,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.1.0"
+//! version = "0.1.1"
 //! features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 //! ```
 //!
@@ -142,7 +142,7 @@ type SyncEventListenerLock = Arc<SyncEventListener>;
 
 type SyncListenersLock = Arc<RwLock<Vec<SyncEventListenerLock>>>;
 
-/// Pooled Event Emitter
+/// Parallel Event Emitter
 ///
 /// Listeners added to the emitter will be invoked in a thread pool concurrently.
 pub struct ParallelEventEmitter {
