@@ -6,6 +6,52 @@
 //! Because all values must be transferred across thread boundaries, all types `T` must be `Send`.
 //!
 //! Additionally, all types `T` must be `Any`, so `T: 'static`.
+//!
+//! ### Usage
+//!
+//! ```toml
+//! [dependencies]
+//! futures = "0.1"
+//! parallel-event-emitter = "0.1.0"
+//! ```
+//!
+//! ```rust
+//! extern crate futures;
+//! extern crate parallel_event_emitter;
+//!
+//! use futures::Future;
+//! use parallel_event_emitter::*;
+//!
+//! fn main() {
+//!     let mut emitter = ParallelEventEmitter::new();
+//!
+//!     emitter.add_listener("some event", || {
+//!         println!("Hello, World!");
+//!
+//!         Ok(())
+//!     }).unwrap();
+//!
+//!     assert_eq!(1, emitter.emit("some event").wait().unwrap());
+//! }
+//! ```
+//!
+//! ### `Trace<E>` type
+//!
+//! This crate depends on the [`trace-error`](https://crates.io/crates/trace-error) crate to have simple and lightweight backtraces on all error `Result`s.
+//!
+//! If you choose not to use that, which is fine by me, simply call `.into_error()` on all `Trace<E>` values to get the real error.
+//!
+//! ### `impl Trait` feature
+//!
+//! Instead of having all the `emit*` methods returning a boxed `Future` (`BoxFuture`),
+//! the Cargo feature **`conservative_impl_trait`** can be given to enable `impl Future` return types on
+//! all the `emit*` methods.
+//!
+//! ```toml
+//! [dependencies.parallel-event-emitter]
+//! version = "0.1.0"
+//! features = ["conservative_impl_trait"]
+//! ```
 
 #![cfg_attr(feature = "conservative_impl_trait", feature(conservative_impl_trait))]
 #![deny(missing_docs)]
@@ -139,7 +185,7 @@ impl ParallelEventEmitter {
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
     #[inline]
-    pub fn add_listener<E: Into<String>>(&mut self, event: E, cb: Box<Fn() -> EventResult<()>>) -> EventResult<u64> where E: Into<String> {
+    pub fn add_listener<F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where F: Fn() -> EventResult<()> + 'static {
         self.add_listener_impl(event.into(), Box::new(move |_| -> EventResult<()> { cb() }))
     }
 
@@ -148,7 +194,7 @@ impl ParallelEventEmitter {
     /// If no value or an incompatible value was passed to `emit*`, `None` is passed.
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
-    pub fn add_listener_value<T, E: Into<String>>(&mut self, event: E, cb: Box<Fn(Option<T>) -> EventResult<()>>) -> EventResult<u64> where T: Any + Clone + Send {
+    pub fn add_listener_value<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Clone + Send, F: Fn(Option<T>) -> EventResult<()> + 'static {
         self.add_listener_impl(event.into(), Box::new(move |arg: Option<ArcCowish>| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
@@ -183,7 +229,7 @@ impl ParallelEventEmitter {
     /// or if you want to avoid cloning values all over the place.
     ///
     /// The return value of this is a unique ID for that listener, which can later be used to remove it if desired.
-    pub fn add_listener_sync<T, E: Into<String>>(&mut self, event: E, cb: Box<Fn(Option<&T>) -> EventResult<()>>) -> EventResult<u64> where T: Any + Send + Sync {
+    pub fn add_listener_sync<T, F, E: Into<String>>(&mut self, event: E, cb: F) -> EventResult<u64> where T: Any + Send + Sync, F: Fn(Option<&T>) -> EventResult<()> + 'static {
         self.add_listener_impl(event.into(), Box::new(move |arg: Option<ArcCowish>| -> EventResult<()> {
             if let Some(arg) = arg {
                 match arg {
@@ -211,7 +257,7 @@ impl ParallelEventEmitter {
     /// If the listener was not found (either doesn't exist or the wrong event given) `Ok(false)` is returned.
     ///
     /// If the listener was removed, `Ok(true)` is returned.
-    pub fn remove_listener<E: Into<String>>(&mut self, event: E, id: u64) -> EventResult<bool> where E: Into<String> {
+    pub fn remove_listener<E: Into<String>>(&mut self, event: E, id: u64) -> EventResult<bool> {
         if let Some(listeners_lock) = try_throw!(self.inner.events.read()).get(&event.into()) {
             let mut listeners = try_throw!(listeners_lock.write());
 
@@ -251,7 +297,7 @@ impl ParallelEventEmitter {
     /// The `Future` returned by `emit` resolves to the number of listeners invoked,
     /// and any errors should be forwarded up.
     #[cfg(feature = "conservative_impl_trait")]
-    pub fn emit<E: Into<String>>(&mut self, event: E) -> impl Future<Item = usize, Error = Trace<EventError>> where E: Into<String> {
+    pub fn emit<E: Into<String>>(&mut self, event: E) -> impl Future<Item = usize, Error = Trace<EventError>> {
         let event = event.into();
         let inner = self.inner.clone();
 
@@ -294,7 +340,7 @@ impl ParallelEventEmitter {
     /// The `Future` returned by `emit` resolves to the number of listeners invoked,
     /// and any errors should be forwarded up.
     #[cfg(not(feature = "conservative_impl_trait"))]
-    pub fn emit<E: Into<String>>(&mut self, event: E) -> BoxFuture<usize, Trace<EventError>> where E: Into<String> {
+    pub fn emit<E: Into<String>>(&mut self, event: E) -> BoxFuture<usize, Trace<EventError>> {
         let event = event.into();
         let inner = self.inner.clone();
 
