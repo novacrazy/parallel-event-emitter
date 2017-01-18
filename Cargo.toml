@@ -1,0 +1,16 @@
+[package]
+authors = ["Aaron Trent <novacrazy@gmail.com>"]
+name = "parallel-event-emitter"
+version = "0.1.0"
+
+[dependencies]
+fnv = "1.0.5"
+futures = "0.1.8"
+futures-cpupool = "0.1.2"
+trace-error = "0.1.2"
+
+[dev-dependencies]
+thread-id = "3.0.0"
+
+[features]
+conservative_impl_trait = []
