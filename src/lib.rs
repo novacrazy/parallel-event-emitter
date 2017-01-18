@@ -94,11 +94,8 @@ use std::sync::atomic::AtomicUsize as AtomicListenerId;
 use fnv::FnvHashMap;
 use std::collections::hash_map::Entry;
 
-use futures::{future, Future};
+use futures::{future, Future, BoxFuture};
 use futures_cpupool::CpuPool;
-
-#[cfg(not(feature = "conservative_impl_trait"))]
-use futures::BoxFuture;
 
 use trace_error::Trace;
 
@@ -149,7 +146,7 @@ pub struct ParallelEventEmitter {
     inner: Arc<Inner>,
 }
 
-/// Inner structure that can be referenced from withing the threadpool and so forth
+/// Inner structure that can be referenced from within the threadpool and listener callbacks
 struct Inner {
     events: RwLock<FnvHashMap<String, SyncListenersLock>>,
     counter: AtomicListenerId,
@@ -364,13 +361,13 @@ impl ParallelEventEmitter {
             if let Some(arg) = arg {
                 match arg {
                     ArcCowish::Borrowed(value) => {
-                        // If the value is borrowed, return return a reference to the local copy
+                        // If the value is borrowed, use the reference to the original copy
                         if let Some(value) = value.downcast_ref::<T>() {
                             return cb(Some(&*value));
                         }
                     }
                     ArcCowish::Owned(value) => {
-                        // If it's owned, do the same thing, although it'll reference the original copy
+                        // If it's owned, do the same, but just use a reference to the local copy
                         if let Some(value) = value.downcast_ref::<T>() {
                             return cb(Some(&*value));
                         }
@@ -388,13 +385,13 @@ impl ParallelEventEmitter {
             if let Some(arg) = arg {
                 match arg {
                     ArcCowish::Borrowed(value) => {
-                        // If the value is borrowed, return return a reference to the local copy
+                        // If the value is borrowed, use the reference to the original copy
                         if let Some(value) = value.downcast_ref::<T>() {
                             return cb(Some(&*value));
                         }
                     }
                     ArcCowish::Owned(value) => {
-                        // If it's owned, do the same thing, although it'll reference the original copy
+                        // If it's owned, do the same, but just use a reference to the local copy
                         if let Some(value) = value.downcast_ref::<T>() {
                             return cb(Some(&*value));
                         }
@@ -444,6 +441,115 @@ impl ParallelEventEmitter {
         Ok(false)
     }
 
+    /// Internal function to facilitate in spawning the listener callback tasks for `emit`
+    fn emit_spawn(inner: Arc<Inner>, event: String) -> EventResult<BoxFuture<usize, Trace<EventError>>> {
+        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
+            let listeners = try_throw!(listeners_lock.read());
+
+            // Don't bother if there aren't any listeners to invoke anyway
+            if listeners.len() > 0 {
+                let mut listener_futures = Vec::with_capacity(listeners.len());
+
+                for listener in listeners.iter() {
+                    // Clone a local copy of the listener that can be sent to the spawn
+                    let listener = listener.clone();
+
+                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
+                        let mut cb_guard = try_throw!(listener.cb.write());
+
+                        // Force a mutable reference to the callback
+                        (&mut *cb_guard)(listener.id, None)
+                    });
+
+                    listener_futures.push(listener_future);
+                }
+
+                return Ok(future::join_all(listener_futures)
+                    .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
+            }
+        }
+
+        Ok(futures::finished(0).boxed())
+    }
+
+    /// Internal function to facilitate in spawning the listener callback tasks for `emit_value`
+    fn emit_value_spawn<T>(inner: Arc<Inner>, event: String, value: T) -> EventResult<BoxFuture<usize, Trace<EventError>>> where T: Any + Clone + Send {
+        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
+            let listeners = try_throw!(listeners_lock.read());
+
+            // Don't bother if there aren't any listeners to invoke anyway
+            if listeners.len() > 0 {
+                let mut listener_futures = Vec::with_capacity(listeners.len());
+
+                for listener in listeners.iter() {
+                    // Clone a local copy of the listener that can be sent to the spawn
+                    let listener = listener.clone();
+
+                    // Clone a local copy of value that can be sent to the listener
+                    let value = value.clone();
+
+                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
+                        let mut cb_guard = try_throw!(listener.cb.write());
+
+                        // Force a mutable reference to the callback
+                        (&mut *cb_guard)(listener.id, Some(ArcCowish::Owned(Box::new(value))))
+                    });
+
+                    listener_futures.push(listener_future);
+                }
+
+                return Ok(future::join_all(listener_futures)
+                    .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
+            }
+        }
+
+        Ok(futures::finished(0).boxed())
+    }
+
+    /// Internal function to facilitate in spawning the listener callback tasks for `emit_value_sync`
+    fn emit_value_sync_spawn<T>(inner: Arc<Inner>, event: String, value: T) -> EventResult<BoxFuture<usize, Trace<EventError>>> where T: Any + Send + Sync {
+        if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
+            let listeners = try_throw!(listeners_lock.read());
+
+            // Don't bother if there aren't any listeners to invoke anyway
+            if listeners.len() > 0 {
+                let mut listener_futures = Vec::with_capacity(listeners.len());
+
+                // We know T is Send, and Box<Any> is really just Box<T>, so it is Send as well
+                #[derive(Clone)]
+                struct SendWrapper {
+                    inner: Arc<Box<Any>>
+                }
+
+                unsafe impl Send for SendWrapper {}
+
+                // Use let binding to coerce value into Any
+                let wrapper = SendWrapper { inner: Arc::new(Box::new(value)) };
+
+                for listener in listeners.iter() {
+                    // Clone a local copy of the listener that can be sent to the spawn
+                    let listener = listener.clone();
+
+                    let wrapper = wrapper.clone();
+
+                    let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
+                        let mut cb_guard = try_throw!(listener.cb.write());
+
+                        // Force a mutable reference to the callback
+                        (&mut *cb_guard)(listener.id, Some(ArcCowish::Borrowed(wrapper.inner)))
+                    });
+
+                    listener_futures.push(listener_future);
+                }
+
+                return Ok(future::join_all(listener_futures)
+                    .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
+            }
+        }
+
+        Ok(futures::finished(0).boxed())
+    }
+
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
     ///
     /// The `Future` returned by `emit` resolves to the number of listeners invoked,
@@ -453,35 +559,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || {
-            if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-                let listeners = try_throw!(listeners_lock.read());
-
-                // Don't bother if there aren't any listeners to invoke anyway
-                if listeners.len() > 0 {
-                    let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                    for listener in listeners.iter() {
-                        // Clone a local copy of the listener that can be sent to the spawn
-                        let listener = listener.clone();
-
-                        let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                            let mut cb_guard = try_throw!(listener.cb.write());
-
-                            // Force a mutable reference to the callback
-                            (&mut *cb_guard)(listener.id, None)
-                        });
-
-                        listener_futures.push(listener_future);
-                    }
-
-                    return Ok(future::join_all(listener_futures)
-                        .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
-                }
-            }
-
-            Ok(futures::finished(0).boxed())
-        }).flatten()
+        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_spawn(inner, event)).flatten()
     }
 
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
@@ -493,35 +571,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || {
-            if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-                let listeners = try_throw!(listeners_lock.read());
-
-                // Don't bother if there aren't any listeners to invoke anyway
-                if listeners.len() > 0 {
-                    let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                    for listener in listeners.iter() {
-                        // Clone a local copy of the listener that can be sent to the spawn
-                        let listener = listener.clone();
-
-                        let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                            let mut cb_guard = try_throw!(listener.cb.write());
-
-                            // Force a mutable reference to the callback
-                            (&mut *cb_guard)(listener.id, None)
-                        });
-
-                        listener_futures.push(listener_future);
-                    }
-
-                    return Ok(future::join_all(listener_futures)
-                        .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
-                }
-            }
-
-            Ok(futures::finished(0).boxed())
-        }).flatten().boxed()
+        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_spawn(inner, event)).flatten().boxed()
     }
 
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
@@ -535,38 +585,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || {
-            if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-                let listeners = try_throw!(listeners_lock.read());
-
-                // Don't bother if there aren't any listeners to invoke anyway
-                if listeners.len() > 0 {
-                    let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                    for listener in listeners.iter() {
-                        // Clone a local copy of the listener that can be sent to the spawn
-                        let listener = listener.clone();
-
-                        // Clone a local copy of value that can be sent to the listener
-                        let value = value.clone();
-
-                        let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                            let mut cb_guard = try_throw!(listener.cb.write());
-
-                            // Force a mutable reference to the callback
-                            (&mut *cb_guard)(listener.id, Some(ArcCowish::Owned(Box::new(value))))
-                        });
-
-                        listener_futures.push(listener_future);
-                    }
-
-                    return Ok(future::join_all(listener_futures)
-                        .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
-                }
-            }
-
-            Ok(futures::finished(0).boxed())
-        }).flatten()
+        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_spawn(inner, event, value)).flatten()
     }
 
     /// Emit an event, invoking all the listeners for that event in the thread pool concurrently.
@@ -580,38 +599,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || {
-            if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-                let listeners = try_throw!(listeners_lock.read());
-
-                // Don't bother if there aren't any listeners to invoke anyway
-                if listeners.len() > 0 {
-                    let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                    for listener in listeners.iter() {
-                        // Clone a local copy of the listener that can be sent to the spawn
-                        let listener = listener.clone();
-
-                        // Clone a local copy of value that can be sent to the listener
-                        let value = value.clone();
-
-                        let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                            let mut cb_guard = try_throw!(listener.cb.write());
-
-                            // Force a mutable reference to the callback
-                            (&mut *cb_guard)(listener.id, Some(ArcCowish::Owned(Box::new(value))))
-                        });
-
-                        listener_futures.push(listener_future);
-                    }
-
-                    return Ok(future::join_all(listener_futures)
-                        .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
-                }
-            }
-
-            Ok(futures::finished(0).boxed())
-        }).flatten().boxed()
+        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_spawn(inner, event, value)).flatten().boxed()
     }
 
     /// Variation of `emit_value` for `Sync` types, where intermediate copies are unnecessary.
@@ -625,48 +613,7 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || {
-            if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-                let listeners = try_throw!(listeners_lock.read());
-
-                // Don't bother if there aren't any listeners to invoke anyway
-                if listeners.len() > 0 {
-                    let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                    // We know T is Send, and Box<Any> is really just Box<T>, so it is Send as well
-                    #[derive(Clone)]
-                    struct SendWrapper {
-                        inner: Arc<Box<Any>>
-                    }
-
-                    unsafe impl Send for SendWrapper {}
-
-                    // Use let binding to coerce value into Any
-                    let wrapper = SendWrapper { inner: Arc::new(Box::new(value)) };
-
-                    for listener in listeners.iter() {
-                        // Clone a local copy of the listener that can be sent to the spawn
-                        let listener = listener.clone();
-
-                        let wrapper = wrapper.clone();
-
-                        let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                            let mut cb_guard = try_throw!(listener.cb.write());
-
-                            // Force a mutable reference to the callback
-                            (&mut *cb_guard)(listener.id, Some(ArcCowish::Borrowed(wrapper.inner)))
-                        });
-
-                        listener_futures.push(listener_future);
-                    }
-
-                    return Ok(future::join_all(listener_futures)
-                        .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
-                }
-            }
-
-            Ok(futures::finished(0).boxed())
-        }).flatten()
+        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_sync_spawn(inner, event, value)).flatten()
     }
 
     /// Variation of `emit_value` for `Sync` types, where intermediate copies are unnecessary.
@@ -680,47 +627,6 @@ impl ParallelEventEmitter {
         let event = event.into();
         let inner = self.inner.clone();
 
-        self.inner.pool.spawn_fn(move || {
-            if let Some(listeners_lock) = try_throw!(inner.events.read()).get(&event) {
-                let listeners = try_throw!(listeners_lock.read());
-
-                // Don't bother if there aren't any listeners to invoke anyway
-                if listeners.len() > 0 {
-                    let mut listener_futures = Vec::with_capacity(listeners.len());
-
-                    // We know T is Send, and Box<Any> is really just Box<T>, so it is Send as well
-                    #[derive(Clone)]
-                    struct SendWrapper {
-                        inner: Arc<Box<Any>>
-                    }
-
-                    unsafe impl Send for SendWrapper {}
-
-                    // Use let binding to coerce value into Any
-                    let wrapper = SendWrapper { inner: Arc::new(Box::new(value)) };
-
-                    for listener in listeners.iter() {
-                        // Clone a local copy of the listener that can be sent to the spawn
-                        let listener = listener.clone();
-
-                        let wrapper = wrapper.clone();
-
-                        let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
-                            let mut cb_guard = try_throw!(listener.cb.write());
-
-                            // Force a mutable reference to the callback
-                            (&mut *cb_guard)(listener.id, Some(ArcCowish::Borrowed(wrapper.inner)))
-                        });
-
-                        listener_futures.push(listener_future);
-                    }
-
-                    return Ok(future::join_all(listener_futures)
-                        .map(|executed: Vec<bool>| executed.iter().filter(|ran| **ran).count()).boxed());
-                }
-            }
-
-            Ok(futures::finished(0).boxed())
-        }).flatten().boxed()
+        self.inner.pool.spawn_fn(move || ParallelEventEmitter::emit_value_sync_spawn(inner, event, value)).flatten().boxed()
     }
 }
