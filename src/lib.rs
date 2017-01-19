@@ -476,27 +476,30 @@ impl<K: EventKey> ParallelEventEmitter<K> {
         self.add_listener_impl(event.clone(), move |id, arg| -> EventResult<bool> {
             let inner = inner_weak.upgrade().expect("Listener invoked after owning ParallelEventEmitter was dropped");
 
-            // Perform the removal before the callback is invoked, so in case it panics or takes a long time to complete it will have already been removed.
-            {
-                match try_throw!(inner.events.write()).entry(event.clone()) {
-                    Entry::Occupied(listeners_lock) => {
-                        let mut listeners = try_throw!(listeners_lock.get().write());
+            let mut events = try_throw!(inner.events.write());
 
-                        if let Ok(index) = listeners.binary_search_by_key(&id, |listener| listener.id) {
-                            listeners.remove(index);
-                        } else {
-                            // If the listener has already been removed in the short time between emitting and this,
-                            // just forget we were here and return ok.
-                            return Ok(false);
-                        }
-                    }
-                    Entry::Vacant(_) => {
+            // Perform the removal before the callback is invoked, so in case it panics or takes a long time to complete it will have already been removed.
+            match events.entry(event.clone()) {
+                Entry::Occupied(listeners_lock) => {
+                    let mut listeners = try_throw!(listeners_lock.get().write());
+
+                    if let Ok(index) = listeners.binary_search_by_key(&id, |listener| listener.id) {
+                        listeners.remove(index);
+                    } else {
                         // If the listener has already been removed in the short time between emitting and this,
                         // just forget we were here and return ok.
                         return Ok(false);
                     }
                 }
+                Entry::Vacant(_) => {
+                    // If the listener has already been removed in the short time between emitting and this,
+                    // just forget we were here and return ok.
+                    return Ok(false);
+                }
             }
+
+            // Free the lock before invoking the callback
+            drop(events);
 
             cb(id, arg).map(internal::ran)
         })
