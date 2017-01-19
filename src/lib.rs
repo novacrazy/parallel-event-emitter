@@ -119,8 +119,12 @@ use std::hash::Hash;
 use fnv::FnvHashMap;
 use std::collections::hash_map::Entry;
 
-use futures::{Future, BoxFuture};
+use futures::Future;
 use futures_cpupool::CpuPool;
+
+// BoxFuture is unused if we use impl Trait instead
+#[cfg(not(feature = "conservative_impl_trait"))]
+use futures::BoxFuture;
 
 use trace_error::Trace;
 
