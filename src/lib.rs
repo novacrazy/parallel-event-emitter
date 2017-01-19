@@ -12,7 +12,7 @@
 //! ```toml
 //! [dependencies]
 //! futures = "0.1"
-//! parallel-event-emitter = "0.2.2"
+//! parallel-event-emitter = "0.2.3"
 //! ```
 //!
 //! Example using a `String` as the key:
@@ -79,7 +79,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.2.2"
+//! version = "0.2.3"
 //! features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 //! ```
 //!
@@ -92,7 +92,7 @@
 //!
 //! ```toml
 //! [dependencies.parallel-event-emitter]
-//! version = "0.2.2"
+//! version = "0.2.3"
 //! features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 //! ```
 //!
@@ -188,6 +188,8 @@ mod internal {
         /// Borrowed value that must be passed by reference
         Borrowed(Arc<Box<Any + Send>>),
     }
+
+    unsafe impl Send for ArcCowish {}
 
     /// This handler callback takes the listener id and the argument,
     /// and returns `Ok(true)` if the listener callback was invoked correctly.
