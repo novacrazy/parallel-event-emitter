@@ -283,10 +283,7 @@ mod internal {
             if listeners.len() > 0 {
                 let mut listener_futures = Vec::with_capacity(listeners.len());
 
-                for listener in listeners.iter() {
-                    // Clone a local copy of the listener that can be sent to the spawn
-                    let listener = listener.clone();
-
+                for listener in listeners.iter().cloned() {
                     let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
                         let mut cb_guard = try_throw!(listener.cb.lock());
 
@@ -313,10 +310,7 @@ mod internal {
             if listeners.len() > 0 {
                 let mut listener_futures = Vec::with_capacity(listeners.len());
 
-                for listener in listeners.iter() {
-                    // Clone a local copy of the listener that can be sent to the spawn
-                    let listener = listener.clone();
-
+                for listener in listeners.iter().cloned() {
                     // Clone a local copy of value that can be sent to the listener
                     let value = value.clone();
 
@@ -354,13 +348,10 @@ mod internal {
 
                 unsafe impl Send for SendWrapper {}
 
-                // Use let binding to coerce value into Any
                 let wrapper = SendWrapper { inner: Arc::new(Box::new(value)) };
 
-                for listener in listeners.iter() {
-                    // Clone a local copy of the listener that can be sent to the spawn
-                    let listener = listener.clone();
-
+                for listener in listeners.iter().cloned() {
+                    // Clone the wrapper to send across the thread boundary
                     let wrapper = wrapper.clone();
 
                     let listener_future = inner.pool.spawn_fn(move || -> EventResult<bool> {
@@ -569,6 +560,8 @@ impl<K: EventKey> ParallelEventEmitter<K> {
         if let Some(listeners_lock) = try_throw!(self.inner.events.read()).get(&event.into()) {
             let mut listeners = try_throw!(listeners_lock.write());
 
+            // Since ids only increase in value, and listeners are always added to the end of the vector,
+            // we can use a binary search for efficiency.
             if let Ok(index) = listeners.binary_search_by_key(&id, |listener| listener.id) {
                 listeners.remove(index);
 
@@ -583,12 +576,12 @@ impl<K: EventKey> ParallelEventEmitter<K> {
     ///
     /// `Ok(false)` is returned if it was not found.
     pub fn remove_any_listener(&mut self, id: ListenerId) -> EventResult<bool> {
-        for (_, listeners_lock) in try_throw!(self.inner.events.read()).iter() {
+        for listeners_lock in try_throw!(self.inner.events.read()).values() {
             let mut listeners = try_throw!(listeners_lock.write());
 
-            let index = listeners.binary_search_by_key(&id, |listener| listener.id);
-
-            if let Ok(index) = index {
+            // Since ids only increase in value, and listeners are always added to the end of the vector,
+            // we can use a binary search for efficiency.
+            if let Ok(index) = listeners.binary_search_by_key(&id, |listener| listener.id) {
                 listeners.remove(index);
 
                 return Ok(true);
