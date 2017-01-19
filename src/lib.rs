@@ -162,7 +162,7 @@ mod internal {
     use futures_cpupool::CpuPool;
 
     #[cfg(feature = "integer_atomics")]
-    pub use std::sync::atomic::AtomicListenerId as AtomicListenerId;
+    pub use std::sync::atomic::AtomicU64 as AtomicListenerId;
 
     #[cfg(not(feature = "integer_atomics"))]
     pub use std::sync::atomic::AtomicUsize as AtomicListenerId;
