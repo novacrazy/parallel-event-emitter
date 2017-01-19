@@ -184,9 +184,9 @@ mod internal {
     /// This allows callbacks to take both values and references depending on the situation
     pub enum ArcCowish {
         /// Owned value that can be moved out
-        Owned(Box<Any>),
+        Owned(Box<Any + Send>),
         /// Borrowed value that must be passed by reference
-        Borrowed(Arc<Box<Any>>),
+        Borrowed(Arc<Box<Any + Send>>),
     }
 
     /// This handler callback takes the listener id and the argument,
@@ -197,7 +197,7 @@ mod internal {
     ///
     /// The odd order of locks and `Arc`s is due to needing to access the `id` field without locking
     pub struct SyncEventListener {
-        /// Unique ID of the listener
+        /// Immutable unique ID of the listener
         pub id: ListenerId,
         /// Lockable callback. It must have a lock because as an `Fn`
         pub cb: Mutex<SyncCallback>,
@@ -344,10 +344,10 @@ mod internal {
             if listeners.len() > 0 {
                 let mut listener_futures = Vec::with_capacity(listeners.len());
 
-                // We know T is Send, and Box<Any> is really just Box<T>, so it is Send as well
+                // We know T is Send, and Box<Any + Send> is really just Box<T>, so it is Send as well
                 #[derive(Clone)]
                 struct SendWrapper {
-                    inner: Arc<Box<Any>>
+                    inner: Arc<Box<Any + Send>>
                 }
 
                 unsafe impl Send for SendWrapper {}
