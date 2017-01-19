@@ -13,7 +13,7 @@ Additionally, all types `T` must be `Any`, so `T: 'static`.
 ```toml
 [dependencies]
 futures = "0.1"
-parallel-event-emitter = "0.2.0"
+parallel-event-emitter = "0.2.1"
 ```
 
 Example using a `String` as the key:
@@ -80,7 +80,7 @@ all the `emit*` methods.
 
 ```toml
 [dependencies.parallel-event-emitter]
-version = "0.2.0"
+version = "0.2.1"
 features = ["default", "conservative_impl_trait"] # And maybe integer_atomics
 ```
 
@@ -93,6 +93,6 @@ To enable true guaranteed 64-bit counters, use the `integer_atomics` feature for
 
 ```toml
 [dependencies.parallel-event-emitter]
-version = "0.2.0"
+version = "0.2.1"
 features = ["default", "integer_atomics"] # And maybe conservative_impl_trait
 ```
